@@ -1,16 +1,11 @@
 import streamlit as st
-import re, io, os, zipfile, unicodedata, subprocess, tempfile
+import re, io, os, copy, zipfile, unicodedata, subprocess, tempfile
 from pathlib import Path
 from openpyxl import load_workbook
-from pypdf import PdfReader, PdfWriter
 from docx import Document
+from docx.oxml.ns import qn
 
-# ── Configurazione pagina ────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="Cartelle Sanitarie",
-    page_icon="📁",
-    layout="centered",
-)
+st.set_page_config(page_title="Cartelle Sanitarie", page_icon="📁", layout="centered")
 
 st.title("📁 Generazione Cartelle Sanitarie")
 st.markdown(
@@ -24,10 +19,6 @@ st.info(
     icon="🔒",
 )
 
-# ════════════════════════════════════════════════════════════════════════════
-# FUNZIONI CORE  (identiche al notebook, ma lavorano su oggetti BytesIO)
-# ════════════════════════════════════════════════════════════════════════════
-
 def sanitizza(s):
     s = str(s).upper().strip()
     s = unicodedata.normalize("NFD", s)
@@ -35,268 +26,200 @@ def sanitizza(s):
     s = re.sub(r"[^A-Z0-9]+", "_", s)
     return s.strip("_")
 
+def split_blocchi(doc):
+    body = doc.element.body
+    blocchi, blocco = [], []
+    for child in list(body):
+        if child.tag == qn('w:sectPr'):
+            blocco.append(child)
+            if blocco:
+                blocchi.append(blocco)
+            break
+        blocco.append(child)
+        if child.tag == qn('w:p'):
+            ppr = child.find(qn('w:pPr'))
+            if ppr is not None and ppr.find(qn('w:sectPr')) is not None:
+                blocchi.append(blocco)
+                blocco = []
+    return blocchi
+
+def ha_nif(blocco):
+    for el in blocco:
+        if re.search(r'NIF\)[^:]*[:–\-]\s*\d{5,}', ''.join(el.itertext())):
+            return True
+    return False
+
+def estrai_docx_bytes(blocco, docx_bytes_originali):
+    doc = Document(io.BytesIO(docx_bytes_originali))
+    body = doc.element.body
+    for child in list(body):
+        body.remove(child)
+    for el in blocco:
+        body.append(copy.deepcopy(el))
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+def docx_bytes_to_pdf_bytes(docx_bytes, tmpdir):
+    tmp = Path(tmpdir)
+    docx_path = tmp / "input.docx"
+    docx_path.write_bytes(docx_bytes)
+    lo_home = tmp / "lo_home"
+    lo_home.mkdir(exist_ok=True)
+    env = {
+        **os.environ,
+        "HOME": str(lo_home),
+        "UserInstallation": f"file://{lo_home}/lo_profile",
+    }
+    res = subprocess.run(
+        ["libreoffice", "--headless", "--norestore", "--nofirststartwizard",
+         "--convert-to", "pdf", "--outdir", str(tmp), str(docx_path)],
+        capture_output=True, text=True, env=env,
+    )
+    pdf_path = tmp / "input.pdf"
+    if not pdf_path.exists():
+        raise RuntimeError(
+            f"Conversione PDF fallita.\nSTDOUT: {res.stdout[-300:]}\nSTDERR: {res.stderr[-300:]}"
+        )
+    data = pdf_path.read_bytes()
+    docx_path.unlink(missing_ok=True)
+    pdf_path.unlink(missing_ok=True)
+    return data
 
 def analizza_docx(fileobj):
-    """Analizza un file docx (BytesIO) e restituisce metadati."""
     doc = Document(fileobj)
     if not doc.tables:
         return None
-
     tipo = "idoneita"
     for p in doc.paragraphs[:5]:
         if "CARTELLA SANITARIA" in p.text.upper():
             tipo = "cartella"
             break
-
     n_lavoratori = 0
-    n_totale     = len(doc.tables)
-    azienda      = None
-
+    azienda = None
     for table in doc.tables:
         cell = table.rows[0].cells[0].text
         if re.search(r'NIF\)[^:]*[:–\-]\s*\d{5,}', cell):
             n_lavoratori += 1
             if azienda is None:
-                m = re.search(
-                    r'Azienda[^:]*:\s*\*{0,2}([^\n*]+?)\*{0,2}\s*(?:Sede|Mansione|$)',
-                    cell
-                )
+                m = re.search(r'Azienda[^:]*:\s*\*{0,2}([^\n*]+?)\*{0,2}\s*(?:Sede|Mansione|$)', cell)
                 if m:
                     azienda = m.group(1).strip()
-
-    return {
-        "tipo":         tipo,
-        "azienda":      azienda,
-        "n_lavoratori": n_lavoratori,
-        "n_totale":     n_totale,
-    }
-
+    return {"tipo": tipo, "azienda": azienda, "n_lavoratori": n_lavoratori}
 
 def analizza_xlsx(fileobj):
-    """Analizza un file xlsx (BytesIO) e restituisce azienda + lista lavoratori."""
     wb = load_workbook(fileobj, read_only=True)
     ws = wb.active
     rows = list(ws.iter_rows(values_only=True))
     wb.close()
-
-    lavoratori = []
-    azienda    = None
+    lavoratori, azienda = [], None
     for row in rows[1:]:
         if row[0] is None:
             continue
         cognome, nome, _, _, _, _, cf, az = row[:8]
         if azienda is None:
             azienda = str(az).strip()
-        nome_cartella = f"{sanitizza(cognome)}_{sanitizza(nome)}_{int(cf)}"
-        lavoratori.append(nome_cartella)
-
+        lavoratori.append(f"{sanitizza(cognome)}_{sanitizza(nome)}_{int(cf)}")
     return {"azienda": azienda, "lavoratori": lavoratori}
 
-
-def docx_bytes_to_pdf_bytes(docx_bytes):
-    """Converte bytes di un docx in bytes PDF tramite LibreOffice."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp = Path(tmpdir)
-        docx_path = tmp / "input.docx"
-        docx_path.write_bytes(docx_bytes)
-
-        # LibreOffice su Streamlit Cloud ha bisogno di una home e
-        # di un profilo utente scrivibile — li creiamo nella tmpdir
-        lo_home = tmp / "lo_home"
-        lo_home.mkdir()
-        env = {
-            **os.environ,
-            "HOME": str(lo_home),
-            "UserInstallation": f"file://{lo_home}/lo_profile",
-        }
-
-        res = subprocess.run(
-            [
-                "libreoffice",
-                "--headless",
-                "--norestore",
-                "--nofirststartwizard",
-                "--convert-to", "pdf",
-                "--outdir", str(tmp),
-                str(docx_path),
-            ],
-            capture_output=True,
-            text=True,
-            env=env,
-        )
-        pdf_path = tmp / "input.pdf"
-        if not pdf_path.exists():
-            raise RuntimeError(
-                f"Conversione PDF fallita.\nSTDOUT: {res.stdout[-300:]}\nSTDERR: {res.stderr[-300:]}"
-            )
-        return pdf_path.read_bytes()
-
-
-def dividi_pdf(pdf_bytes, n_totale, lavoratori, tipo):
-    """
-    Divide un PDF in blocchi e restituisce un dict:
-      { nome_cartella: pdf_bytes }
-    """
-    reader   = PdfReader(io.BytesIO(pdf_bytes))
-    n_pagine = len(reader.pages)
-
-    if n_pagine % n_totale != 0:
-        raise ValueError(
-            f"Il PDF ha {n_pagine} pagine ma {n_totale} blocchi — "
-            f"la divisione non è intera. Verifica il file sorgente."
-        )
-
-    ppp     = n_pagine // n_totale
-    risultati = {}
-
-    for i, nome_cartella in enumerate(lavoratori):
-        writer = PdfWriter()
-        for p in range(i * ppp, i * ppp + ppp):
-            writer.add_page(reader.pages[p])
-        buf = io.BytesIO()
-        writer.write(buf)
-        risultati[nome_cartella] = buf.getvalue()
-
-    return risultati, ppp
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# INTERFACCIA
-# ════════════════════════════════════════════════════════════════════════════
+# ── UI ───────────────────────────────────────────────────────────────────────
 
 uploaded = st.file_uploader(
     "Trascina qui i file oppure clicca per selezionarli",
     type=["docx", "xlsx"],
     accept_multiple_files=True,
-    help="Puoi caricare file di più aziende contemporaneamente.",
 )
 
 if uploaded:
     docx_files = [f for f in uploaded if f.name.lower().endswith(".docx")]
-    xlsx_files = [f for f in uploaded if f.name.lower().endswith(".xlsx")]
-
+    xlsx_files  = [f for f in uploaded if f.name.lower().endswith(".xlsx")]
     st.markdown(f"**File caricati:** {len(docx_files)} docx · {len(xlsx_files)} xlsx")
 
-    # Analisi rapida per feedback immediato
     with st.expander("📋 Dettaglio file riconosciuti", expanded=False):
         for f in docx_files:
             info = analizza_docx(io.BytesIO(f.read()))
             f.seek(0)
             if info and info["n_lavoratori"] > 1:
-                st.success(
-                    f"✅ **{f.name}** — {info['tipo']} · "
-                    f"{info['n_lavoratori']} lavoratori · {info['azienda']}"
-                )
+                st.success(f"✅ **{f.name}** — {info['tipo']} · {info['n_lavoratori']} lavoratori · {info['azienda']}")
             elif info:
                 st.warning(f"⏭️ **{f.name}** — file singolo (BASE), verrà ignorato")
             else:
                 st.error(f"❌ **{f.name}** — non riconoscibile")
-
         for f in xlsx_files:
             info = analizza_xlsx(io.BytesIO(f.read()))
             f.seek(0)
-            st.info(
-                f"📊 **{f.name}** — {info['azienda']} · "
-                f"{len(info['lavoratori'])} lavoratori"
-            )
+            st.info(f"📊 **{f.name}** — {info['azienda']} · {len(info['lavoratori'])} lavoratori")
 
     st.divider()
 
     if st.button("🚀 Genera cartelle", type="primary", use_container_width=True):
-
         progress = st.progress(0, text="Avvio elaborazione...")
-        log      = st.empty()
-
+        log = st.empty()
         try:
-            # ── Analisi ──────────────────────────────────────────────────
+            # Analisi
             docx_info = []
             for f in docx_files:
-                info = analizza_docx(io.BytesIO(f.read()))
-                f.seek(0)
+                raw = f.read(); f.seek(0)
+                info = analizza_docx(io.BytesIO(raw))
                 if info and info["n_lavoratori"] > 1:
-                    info["fileobj"] = f
+                    info["raw"] = raw
                     docx_info.append(info)
 
             xlsx_map = {}
             for f in xlsx_files:
-                info = analizza_xlsx(io.BytesIO(f.read()))
-                f.seek(0)
+                info = analizza_xlsx(io.BytesIO(f.read())); f.seek(0)
                 if info["azienda"]:
                     xlsx_map[sanitizza(info["azienda"])] = info
 
-            # ── Abbinamento ───────────────────────────────────────────────
-            jobs = []
-            errori = []
+            # Abbinamento
+            jobs, errori = [], []
             for d in docx_info:
                 key = sanitizza(d["azienda"] or "")
                 if key not in xlsx_map:
-                    errori.append(
-                        f"Nessuna anagrafica xlsx per l'azienda: **{d['azienda']}**"
-                    )
+                    errori.append(f"Nessuna anagrafica xlsx per: **{d['azienda']}**")
                     continue
                 xl = xlsx_map[key]
-                n_reali    = min(len(xl["lavoratori"]), d["n_lavoratori"])
-                lavoratori = xl["lavoratori"][:n_reali]
+                doc = Document(io.BytesIO(d["raw"]))
+                blocchi_reali = [b for b in split_blocchi(doc) if ha_nif(b)]
+                n = min(len(xl["lavoratori"]), len(blocchi_reali))
                 jobs.append({
-                    "label":      f"{d['tipo'].upper()} – {d['azienda']}",
-                    "tipo":       d["tipo"],
-                    "n_totale":   d["n_totale"],
-                    "lavoratori": lavoratori,
-                    "fileobj":    d["fileobj"],
+                    "label": f"{d['tipo'].upper()} – {d['azienda']}",
+                    "tipo": d["tipo"],
+                    "raw": d["raw"],
+                    "blocchi": blocchi_reali[:n],
+                    "lavoratori": xl["lavoratori"][:n],
                 })
 
             if errori:
-                for e in errori:
-                    st.error(e)
+                for e in errori: st.error(e)
                 st.stop()
 
-            # ── Elaborazione ──────────────────────────────────────────────
-            # zip in memoria
-            zip_buf  = io.BytesIO()
-            n_totale_jobs = len(jobs)
-
+            # Elaborazione
+            n_jobs = len(jobs)
+            zip_buf = io.BytesIO()
             with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                for ji, job in enumerate(jobs):
-                    pct_base = ji / n_totale_jobs
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    for ji, job in enumerate(jobs):
+                        n_lav = len(job["lavoratori"])
+                        for i, (nome_cartella, blocco) in enumerate(zip(job["lavoratori"], job["blocchi"])):
+                            log.markdown(f"⏳ **{job['label']}** — {nome_cartella} ({i+1}/{n_lav})")
+                            progress.progress(
+                                (ji * n_lav + i) / (n_jobs * n_lav),
+                                text=f"{job['tipo']} {i+1}/{n_lav}"
+                            )
+                            docx_b = estrai_docx_bytes(blocco, job["raw"])
+                            pdf_b  = docx_bytes_to_pdf_bytes(docx_b, tmpdir)
+                            zf.writestr(f"{nome_cartella}/{job['tipo']}_{nome_cartella}.pdf", pdf_b)
 
-                    log.markdown(f"⏳ Conversione in PDF: **{job['label']}**...")
-                    progress.progress(pct_base + 0.1 / n_totale_jobs,
-                                      text=f"Conversione PDF ({ji+1}/{n_totale_jobs})...")
-
-                    pdf_bytes = docx_bytes_to_pdf_bytes(job["fileobj"].read())
-                    job["fileobj"].seek(0)
-
-                    log.markdown(f"✂️ Suddivisione: **{job['label']}** "
-                                 f"({len(job['lavoratori'])} lavoratori)...")
-                    progress.progress(pct_base + 0.4 / n_totale_jobs,
-                                      text=f"Suddivisione ({ji+1}/{n_totale_jobs})...")
-
-                    risultati, ppp = dividi_pdf(
-                        pdf_bytes, job["n_totale"],
-                        job["lavoratori"], job["tipo"]
-                    )
-
-                    for nome_cartella, pdf_data in risultati.items():
-                        path_zip = f"{nome_cartella}/{job['tipo']}_{nome_cartella}.pdf"
-                        zf.writestr(path_zip, pdf_data)
-
-                    progress.progress((ji + 1) / n_totale_jobs,
-                                      text=f"Completato {ji+1}/{n_totale_jobs}")
-
-            progress.progress(1.0, text="✅ Elaborazione completata!")
+            progress.progress(1.0, text="✅ Completato!")
             log.empty()
 
-            n_cartelle = len(set(
-                p.split("/")[0]
-                for p in [zi.filename for zi in
-                           zipfile.ZipFile(io.BytesIO(zip_buf.getvalue())).infolist()]
-            ))
-            st.success(
-                f"✅ **Elaborazione completata!**  \n"
-                f"{n_cartelle} cartelle generate · "
-                f"{len(jobs) * 1} file PDF per tipo"
-            )
-
+            n_cartelle = len({
+                zi.filename.split("/")[0]
+                for zi in zipfile.ZipFile(io.BytesIO(zip_buf.getvalue())).infolist()
+                if "/" in zi.filename
+            })
+            st.success(f"✅ **Elaborazione completata!** {n_cartelle} cartelle generate.")
             zip_buf.seek(0)
             st.download_button(
                 label="⬇️  Scarica cartelle_sanitarie.zip",
