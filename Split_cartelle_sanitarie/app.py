@@ -100,14 +100,35 @@ def docx_bytes_to_pdf_bytes(docx_bytes):
         docx_path = tmp / "input.docx"
         docx_path.write_bytes(docx_bytes)
 
-        subprocess.run(
-            ["libreoffice", "--headless", "--convert-to", "pdf",
-             "--outdir", str(tmp), str(docx_path)],
-            capture_output=True, check=True
+        # LibreOffice su Streamlit Cloud ha bisogno di una home e
+        # di un profilo utente scrivibile — li creiamo nella tmpdir
+        lo_home = tmp / "lo_home"
+        lo_home.mkdir()
+        env = {
+            **os.environ,
+            "HOME": str(lo_home),
+            "UserInstallation": f"file://{lo_home}/lo_profile",
+        }
+
+        res = subprocess.run(
+            [
+                "libreoffice",
+                "--headless",
+                "--norestore",
+                "--nofirststartwizard",
+                "--convert-to", "pdf",
+                "--outdir", str(tmp),
+                str(docx_path),
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
         )
         pdf_path = tmp / "input.pdf"
         if not pdf_path.exists():
-            raise RuntimeError("Conversione PDF fallita.")
+            raise RuntimeError(
+                f"Conversione PDF fallita.\nSTDOUT: {res.stdout[-300:]}\nSTDERR: {res.stderr[-300:]}"
+            )
         return pdf_path.read_bytes()
 
 
