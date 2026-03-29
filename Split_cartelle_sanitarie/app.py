@@ -1,5 +1,5 @@
 import streamlit as st
-import re, io, zipfile, unicodedata, subprocess, tempfile
+import re, io, os, zipfile, unicodedata, subprocess, tempfile
 from pathlib import Path
 from openpyxl import load_workbook
 from pypdf import PdfReader, PdfWriter
